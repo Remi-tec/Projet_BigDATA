@@ -3,12 +3,13 @@
   Ingestion API - VéloStar Rennes (GBFS / OpenDataSoft)
 =============================================================
 Ce script collecte les données en temps réel des stations
-VéloStar de Rennes et les sauvegarde dans le Data Lake local
-(dossier raw/).
+VéloStar de Rennes et les sauvegarde dans le Data Lake local.
 
-Données récoltées :
-  - station_information : nom, localisation (lat/lon), capacité
-  - station_status      : vélos dispo, places dispo, état
+Stratégie :
+  Étape 1 → Appel à l'index du dataset (vls-gbfs-tr) pour
+             récupérer les URLs réelles des flux GBFS.
+  Étape 2 → Appel direct à chaque URL GBFS pour récupérer
+             les données brutes (station_information, station_status…)
 
 Standard : GBFS (General Bikeshare Feed Specification)
 Source    : https://data.rennesmetropole.fr/explore/dataset/vls-gbfs-tr
@@ -24,14 +25,16 @@ from datetime import datetime
 # Configuration
 # ─────────────────────────────────────────────
 
-# Endpoints GBFS du STAR Rennes (Opendatasoft)
-BASE_URL = "https://data.rennesmetropole.fr/api/explore/v2.1/catalog/datasets"
-DATASET  = "vls-gbfs-tr"
+# Endpoint de l'index GBFS (liste des flux disponibles)
+INDEX_URL = (
+    "https://data.rennesmetropole.fr/api/explore/v2.1"
+    "/catalog/datasets/vls-gbfs-tr/records?limit=20"
+)
 
-# Fichiers GBFS disponibles dans le dataset
-GBFS_FILES = {
-    "station_information": "station_information",
-    "station_status":      "station_status",
+# Flux GBFS à collecter (correspondance idfilegbfs → nom de fichier local)
+TARGET_FEEDS = {
+    "station_information.json": "station_information",
+    "station_status.json":      "station_status",
 }
 
 # Dossier de stockage brut (Data Lake local)
@@ -62,44 +65,33 @@ def create_data_lake_dir() -> str:
     return folder
 
 
-def fetch_gbfs_file(feed_name: str) -> dict:
+def fetch_index() -> dict:
     """
-    Récupère un fichier GBFS depuis l'API Opendatasoft.
+    Appelle l'index du dataset pour récupérer la liste des flux GBFS.
 
-    L'API expose les enregistrements GBFS sous forme de records,
-    chaque record contenant le contenu JSON du flux correspondant.
+    Retourne un dict { idfilegbfs → filegbfsurl }
+    ex: { "station_status.json": "https://eu.ftp.opendatasoft.com/..." }
     """
-    url = f"{BASE_URL}/{DATASET}/records"
-    params = {
-        "where": f"name='{feed_name}'",
-        "limit": 1,
-    }
-
-    logger.info(f"Requête API → {feed_name}")
-    response = requests.get(url, params=params, timeout=15)
+    logger.info("Récupération de l'index GBFS...")
+    response = requests.get(INDEX_URL, timeout=15)
     response.raise_for_status()
 
-    data = response.json()
-    logger.info(f"Réponse reçue pour '{feed_name}' (status {response.status_code})")
-    return data
+    records = response.json().get("results", [])
+    index = {r["idfilegbfs"]: r["filegbfsurl"] for r in records if "filegbfsurl" in r}
+
+    logger.info(f"{len(index)} flux trouvés dans l'index :")
+    for name, url in index.items():
+        logger.info(f"   {name:35s} → {url}")
+
+    return index
 
 
-def fetch_all_records(limit: int = 100) -> dict:
-    """
-    Récupère tous les enregistrements du dataset d'un coup.
-    Utile pour explorer la structure complète.
-    """
-    url = f"{BASE_URL}/{DATASET}/records"
-    params = {"limit": limit}
-
-    logger.info("Récupération de tous les enregistrements du dataset...")
-    response = requests.get(url, params=params, timeout=15)
+def fetch_gbfs_feed(url: str, feed_name: str) -> dict:
+    """Télécharge directement un fichier GBFS depuis son URL FTP/HTTP."""
+    logger.info(f"Téléchargement de '{feed_name}' depuis {url}")
+    response = requests.get(url, timeout=15)
     response.raise_for_status()
-
-    data = response.json()
-    total = data.get("total_count", "?")
-    logger.info(f"Total enregistrements disponibles : {total}")
-    return data
+    return response.json()
 
 
 def save_to_lake(data: dict, folder: str, filename: str) -> str:
@@ -117,7 +109,7 @@ def add_metadata(data: dict, source: str) -> dict:
         "_metadata": {
             "source":       source,
             "collected_at": datetime.now().isoformat(),
-            "dataset":      DATASET,
+            "dataset":      "vls-gbfs-tr",
         },
         "data": data,
     }
@@ -129,42 +121,59 @@ def add_metadata(data: dict, source: str) -> dict:
 
 def run_ingestion():
     """Lance le pipeline complet d'ingestion."""
-    logger.info("=" * 50)
-    logger.info("  Démarrage de l'ingestion VéloStar Rennes")
-    logger.info("=" * 50)
+    logger.info("=" * 55)
+    logger.info("   Démarrage de l'ingestion VéloStar Rennes")
+    logger.info("=" * 55)
 
     # 1. Créer le dossier de stockage horodaté
     folder = create_data_lake_dir()
-
     collected_files = []
 
-    # 2. Récupérer tous les enregistrements du dataset (vue globale)
+    # 2. Récupérer l'index pour obtenir les URLs réelles
     try:
-        all_records = fetch_all_records(limit=100)
-        enriched = add_metadata(all_records, source=f"{BASE_URL}/{DATASET}/records")
-        path = save_to_lake(enriched, folder, "all_records")
-        collected_files.append(path)
+        feed_index = fetch_index()
     except requests.RequestException as e:
-        logger.error(f"Erreur lors de la récupération globale : {e}")
+        logger.error(f"Impossible de récupérer l'index GBFS : {e}")
+        return
 
-    # 3. Tentative de récupération par fichier GBFS spécifique
-    for feed_name, filename in GBFS_FILES.items():
+    # Sauvegarder l'index brut dans le Data Lake
+    index_enriched = add_metadata({"feeds": feed_index}, source=INDEX_URL)
+    collected_files.append(save_to_lake(index_enriched, folder, "gbfs_index"))
+
+    # 3. Télécharger chaque flux GBFS ciblé via son URL directe
+    for feed_id, local_name in TARGET_FEEDS.items():
+        if feed_id not in feed_index:
+            logger.warning(f"'{feed_id}' absent de l'index, passage au suivant.")
+            continue
+
+        url = feed_index[feed_id]
         try:
-            raw_data = fetch_gbfs_file(feed_name)
-            enriched = add_metadata(raw_data, source=f"{BASE_URL}/{DATASET}/records?where=name='{feed_name}'")
-            path = save_to_lake(enriched, folder, filename)
+            raw_data = fetch_gbfs_feed(url, feed_id)
+            enriched = add_metadata(raw_data, source=url)
+            path     = save_to_lake(enriched, folder, local_name)
             collected_files.append(path)
+            _log_summary(raw_data, local_name)
         except requests.RequestException as e:
-            logger.warning(f"Impossible de récupérer '{feed_name}' : {e}")
+            logger.error(f"Erreur sur '{feed_id}' : {e}")
 
-    # 4. Résumé de la collecte
-    logger.info("-" * 50)
-    logger.info(f"Ingestion terminée. {len(collected_files)} fichier(s) sauvegardé(s) :")
+    # 4. Résumé final
+    logger.info("-" * 55)
+    logger.info(f"Ingestion terminée — {len(collected_files)} fichier(s) sauvegardé(s) :")
     for f in collected_files:
-        logger.info(f"  → {f}")
-    logger.info("=" * 50)
+        logger.info(f"   → {f}")
+    logger.info("=" * 55)
 
     return folder
+
+
+def _log_summary(data: dict, feed_name: str):
+    """Affiche un résumé rapide du contenu d'un flux GBFS."""
+    try:
+        items = data.get("data", {}).get("stations", [])
+        if items:
+            logger.info(f"   [{feed_name}] {len(items)} station(s) trouvée(s).")
+    except Exception:
+        pass  # résumé facultatif, ne bloque pas
 
 
 # ─────────────────────────────────────────────
