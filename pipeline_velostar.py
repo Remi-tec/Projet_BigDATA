@@ -20,9 +20,9 @@ Tests unitaires :
 """
 
 import os
-import glob
 import json
 import logging
+from io import BytesIO
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -44,6 +44,138 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
+# Stockage MinIO
+# ─────────────────────────────────────────────
+
+class StorageBackend:
+    """Interface minimale pour le stockage objet."""
+
+    def make_batch_folder(self, base_dir: str) -> str:
+        raise NotImplementedError
+
+    def save_json(self, folder: str, filename: str, data: dict) -> str:
+        raise NotImplementedError
+
+    def load_json(self, folder: str, filename: str) -> dict:
+        raise NotImplementedError
+
+    def save_csv(self, df: pd.DataFrame, processed_dir: str, filename: str) -> str:
+        raise NotImplementedError
+
+    def load_csv(self, path: str, **kwargs) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def list_batches(self, base_dir: str) -> list[str]:
+        raise NotImplementedError
+
+    def list_csvs(self, processed_dir: str) -> list[str]:
+        raise NotImplementedError
+
+
+class MinIOStorage(StorageBackend):
+    """Stockage objet MinIO compatible S3."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        bucket: str,
+        secure: bool = False,
+    ):
+        try:
+            from minio import Minio
+        except Exception as exc:
+            raise RuntimeError("Le paquet 'minio' est requis pour STORAGE_BACKEND=minio") from exc
+
+        self.client = Minio(
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure,
+        )
+        self.bucket = bucket
+        if not self.client.bucket_exists(bucket):
+            self.client.make_bucket(bucket)
+
+    @staticmethod
+    def _clean_path(path: str) -> str:
+        return path.replace("\\", "/").lstrip("/")
+
+    def make_batch_folder(self, base_dir: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder = f"{self._clean_path(base_dir)}/{timestamp}"
+        logger.info(f"Batch MinIO : {folder}")
+        return folder
+
+    def save_json(self, folder: str, filename: str, data: dict) -> str:
+        key = f"{self._clean_path(folder)}/{filename}.json"
+        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        self.client.put_object(self.bucket, key, BytesIO(payload), length=len(payload))
+        logger.info(f"Sauvegardé (MinIO) : s3://{self.bucket}/{key}")
+        return key
+
+    def load_json(self, folder: str, filename: str) -> dict:
+        key = f"{self._clean_path(folder)}/{filename}.json"
+        obj = self.client.get_object(self.bucket, key)
+        try:
+            return json.loads(obj.read().decode("utf-8"))
+        finally:
+            obj.close()
+            obj.release_conn()
+
+    def save_csv(self, df: pd.DataFrame, processed_dir: str, filename: str) -> str:
+        key = f"{self._clean_path(processed_dir)}/{filename}"
+        payload = df.to_csv(index=False, encoding="utf-8").encode("utf-8")
+        self.client.put_object(self.bucket, key, BytesIO(payload), length=len(payload))
+        logger.info(f"CSV exporté (MinIO) : s3://{self.bucket}/{key}")
+        return key
+
+    def load_csv(self, path: str, **kwargs) -> pd.DataFrame:
+        key = self._clean_path(path)
+        obj = self.client.get_object(self.bucket, key)
+        try:
+            return pd.read_csv(BytesIO(obj.read()), **kwargs)
+        finally:
+            obj.close()
+            obj.release_conn()
+
+    def list_batches(self, base_dir: str) -> list[str]:
+        prefix = f"{self._clean_path(base_dir)}/"
+        batches: set[str] = set()
+        for obj in self.client.list_objects(self.bucket, prefix=prefix, recursive=True):
+            rest = obj.object_name[len(prefix):]
+            if "/" in rest:
+                batches.add(f"{prefix}{rest.split('/', 1)[0]}")
+        return sorted(batches)
+
+    def list_csvs(self, processed_dir: str) -> list[str]:
+        prefix = f"{self._clean_path(processed_dir)}/"
+        files = []
+        for obj in self.client.list_objects(self.bucket, prefix=prefix, recursive=True):
+            if obj.object_name.startswith(prefix) and obj.object_name.endswith(".csv"):
+                name = obj.object_name.split("/")[-1]
+                if name.startswith("velostar_"):
+                    files.append(obj.object_name)
+        return sorted(files)
+
+
+def create_storage_from_env() -> StorageBackend:
+    backend = os.getenv("STORAGE_BACKEND", "").lower()
+    if backend == "minio":
+        endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+        access_key = os.getenv("MINIO_ACCESS_KEY", os.getenv("MINIO_ROOT_USER", "admin"))
+        secret_key = os.getenv("MINIO_SECRET_KEY", os.getenv("MINIO_ROOT_PASSWORD", "password123"))
+        bucket = os.getenv("MINIO_BUCKET", "velostar")
+        secure = os.getenv("MINIO_SECURE", "false").lower() in {"1", "true", "yes"}
+        logger.info("Stockage actif : MinIO")
+        return MinIOStorage(endpoint, access_key, secret_key, bucket, secure=secure)
+    raise RuntimeError(
+        "STORAGE_BACKEND doit etre 'minio'. Le stockage disque est desactive."
+    )
+
+
+# ─────────────────────────────────────────────
 # GBFSIngester
 # ─────────────────────────────────────────────
 
@@ -53,7 +185,7 @@ class GBFSIngester:
 
     Étape 1 : récupère l'index du dataset pour obtenir les URLs réelles.
     Étape 2 : télécharge chaque flux GBFS ciblé via son URL directe.
-    Étape 3 : sauvegarde les données brutes dans le Data Lake local (raw/).
+    Étape 3 : sauvegarde les données brutes dans le Data Lake MinIO.
     """
 
     INDEX_URL = (
@@ -66,8 +198,13 @@ class GBFSIngester:
         "station_status.json":      "station_status",
     }
 
-    def __init__(self, data_lake_dir: str = os.path.join("raw", "velostar")):
+    def __init__(
+        self,
+        data_lake_dir: str = os.path.join("raw", "velostar"),
+        storage: StorageBackend | None = None,
+    ):
         self.data_lake_dir = data_lake_dir
+        self.storage = storage or create_storage_from_env()
         self.output_folder: str | None = None
 
     # ── Méthodes publiques ──────────────────────
@@ -75,7 +212,7 @@ class GBFSIngester:
     def run(self) -> str:
         """Lance l'ingestion complète et retourne le dossier de collecte."""
         logger.info("── Ingestion démarrée ──────────────────────────")
-        self.output_folder = self._create_batch_folder()
+        self.output_folder = self.storage.make_batch_folder(self.data_lake_dir)
 
         feed_index = self._fetch_index()
         self._save(
@@ -104,13 +241,6 @@ class GBFSIngester:
 
     # ── Méthodes privées ────────────────────────
 
-    def _create_batch_folder(self) -> str:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder = os.path.join(self.data_lake_dir, timestamp)
-        os.makedirs(folder, exist_ok=True)
-        logger.info(f"Dossier batch créé : {folder}")
-        return folder
-
     def _fetch_index(self) -> dict:
         logger.info("Récupération de l'index GBFS...")
         response = requests.get(self.INDEX_URL, timeout=15)
@@ -137,11 +267,7 @@ class GBFSIngester:
         }
 
     def _save(self, data: dict, filename: str) -> str:
-        path = os.path.join(self.output_folder, f"{filename}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"Sauvegardé : {path}")
-        return path
+        return self.storage.save_json(self.output_folder, filename, data)
 
 
 # ─────────────────────────────────────────────
@@ -158,7 +284,7 @@ class VeloStarTransformer:
       - Conversion des timestamps Unix en datetime UTC
       - Calcul du taux de remplissage (fill_rate)
       - Ajout du label de disponibilité
-      - Export CSV dans processed/
+    - Export CSV dans le stockage MinIO
     """
 
     INFO_COLS   = ["station_id", "name", "address", "post_code", "lat", "lon", "capacity"]
@@ -179,9 +305,11 @@ class VeloStarTransformer:
         self,
         data_lake_dir: str = os.path.join("raw", "velostar"),
         processed_dir: str = "processed",
+        storage: StorageBackend | None = None,
     ):
         self.data_lake_dir = data_lake_dir
         self.processed_dir = processed_dir
+        self.storage = storage or create_storage_from_env()
 
     # ── Méthodes publiques ──────────────────────
 
@@ -251,16 +379,14 @@ class VeloStarTransformer:
     # ── Méthodes privées ────────────────────────
 
     def _get_latest_batch(self) -> str:
-        batches = sorted(glob.glob(os.path.join(self.data_lake_dir, "*")))
+        batches = self.storage.list_batches(self.data_lake_dir)
         if not batches:
             raise FileNotFoundError(f"Aucun batch dans {self.data_lake_dir}")
         logger.info(f"Batch sélectionné : {batches[-1]}")
         return batches[-1]
 
     def _load_json(self, folder: str, filename: str) -> dict:
-        path = os.path.join(folder, f"{filename}.json")
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return self.storage.load_json(folder, filename)
 
     def _extract_stations(self, wrapper: dict) -> list:
         return wrapper["data"]["data"]["stations"]
@@ -274,12 +400,9 @@ class VeloStarTransformer:
         return "Indisponible"
 
     def _export_csv(self, df: pd.DataFrame) -> str:
-        os.makedirs(self.processed_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path      = os.path.join(self.processed_dir, f"velostar_{timestamp}.csv")
-        df.to_csv(path, index=False, encoding="utf-8")
-        logger.info(f"CSV exporté : {path}")
-        return path
+        filename = f"velostar_{timestamp}.csv"
+        return self.storage.save_csv(df, self.processed_dir, filename)
 
     def _log_stats(self, df: pd.DataFrame):
         logger.info("-" * 50)
@@ -357,8 +480,10 @@ class PostgreSQLLoader:
         user:     str = os.getenv("DB_USER",     "postgres"),
         password: str = os.getenv("DB_PASSWORD", ""),
         processed_dir: str = "processed",
+        storage: StorageBackend | None = None,
     ):
         self.processed_dir = processed_dir
+        self.storage = storage or create_storage_from_env()
         self._engine = self._create_engine(host, port, dbname, user, password)
 
     # ── Méthodes publiques ──────────────────────
@@ -369,7 +494,7 @@ class PostgreSQLLoader:
         self.create_tables()
 
         path = csv_path or self._get_latest_csv()
-        df   = pd.read_csv(path, parse_dates=["last_reported", "collected_at"])
+        df   = self.storage.load_csv(path, parse_dates=["last_reported", "collected_at"])
         logger.info(f"CSV chargé : {len(df)} lignes.")
 
         self.load_stations_info(df)
@@ -424,7 +549,7 @@ class PostgreSQLLoader:
         return engine
 
     def _get_latest_csv(self) -> str:
-        files = sorted(glob.glob(os.path.join(self.processed_dir, "velostar_*.csv")))
+        files = self.storage.list_csvs(self.processed_dir)
         if not files:
             raise FileNotFoundError(f"Aucun CSV dans {self.processed_dir}/")
         logger.info(f"CSV sélectionné : {files[-1]}")
@@ -451,12 +576,14 @@ class VeloStarPipeline:
         data_lake_dir: str = os.path.join("raw", "velostar"),
         processed_dir: str = "processed",
     ):
-        self.ingester    = GBFSIngester(data_lake_dir=data_lake_dir)
+        storage = create_storage_from_env()
+        self.ingester    = GBFSIngester(data_lake_dir=data_lake_dir, storage=storage)
         self.transformer = VeloStarTransformer(
             data_lake_dir=data_lake_dir,
             processed_dir=processed_dir,
+            storage=storage,
         )
-        self.loader      = PostgreSQLLoader(processed_dir=processed_dir)
+        self.loader      = PostgreSQLLoader(processed_dir=processed_dir, storage=storage)
 
     def run(self) -> None:
         """Exécute le pipeline complet."""

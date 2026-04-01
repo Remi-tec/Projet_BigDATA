@@ -14,7 +14,44 @@ import os
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch, mock_open
-from pipeline_velostar import GBFSIngester, VeloStarTransformer, PostgreSQLLoader
+from pipeline_velostar import GBFSIngester, VeloStarTransformer, PostgreSQLLoader, StorageBackend
+
+
+class DummyStorage(StorageBackend):
+    """Stockage en memoire pour les tests unitaires."""
+
+    def __init__(self):
+        self._json = {}
+        self._csv = {}
+
+    def make_batch_folder(self, base_dir: str) -> str:
+        return f"{base_dir}/test"
+
+    def save_json(self, folder: str, filename: str, data: dict) -> str:
+        key = f"{folder}/{filename}.json"
+        self._json[key] = data
+        return key
+
+    def load_json(self, folder: str, filename: str) -> dict:
+        key = f"{folder}/{filename}.json"
+        return self._json[key]
+
+    def save_csv(self, df: pd.DataFrame, processed_dir: str, filename: str) -> str:
+        key = f"{processed_dir}/{filename}"
+        self._csv[key] = df.copy()
+        return key
+
+    def load_csv(self, path: str, **kwargs) -> pd.DataFrame:
+        df = self._csv[path].copy()
+        for col in kwargs.get("parse_dates", []):
+            df[col] = pd.to_datetime(df[col])
+        return df
+
+    def list_batches(self, base_dir: str) -> list[str]:
+        return [f"{base_dir}/test"]
+
+    def list_csvs(self, processed_dir: str) -> list[str]:
+        return [key for key in self._csv.keys() if key.startswith(f"{processed_dir}/velostar_")]
 
 
 # ─────────────────────────────────────────────
@@ -104,7 +141,7 @@ FAKE_WRAPPER_STATUS = {
 class TestGBFSIngester:
 
     def setup_method(self):
-        self.ingester = GBFSIngester(data_lake_dir="raw/test")
+        self.ingester = GBFSIngester(data_lake_dir="raw/test", storage=DummyStorage())
 
     @patch("pipeline_velostar.requests.get")
     def test_fetch_index_returns_dict(self, mock_get):
@@ -153,7 +190,7 @@ class TestGBFSIngester:
 class TestVeloStarTransformer:
 
     def setup_method(self):
-        self.transformer = VeloStarTransformer()
+        self.transformer = VeloStarTransformer(storage=DummyStorage())
         self.stations_info   = FAKE_STATION_INFO["data"]["stations"]
         self.stations_status = FAKE_STATION_STATUS["data"]["stations"]
 
@@ -253,6 +290,7 @@ class TestPostgreSQLLoader:
         """Instancie un loader avec un moteur mocké."""
         loader = PostgreSQLLoader.__new__(PostgreSQLLoader)
         loader.processed_dir = "processed"
+        loader.storage       = DummyStorage()
         loader._engine       = mock_engine
         return loader
 
