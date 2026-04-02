@@ -10,10 +10,10 @@ load_dotenv()
 class VeloDashboard:
     def __init__(self):
         user = os.getenv("DB_USER", "postgres")
-        pw = os.getenv("DB_PASS", "mot_de_passe")
+        pw = os.getenv("DB_PASSWORD", "")
         host = os.getenv("DB_HOST", "localhost")
         port = os.getenv("DB_PORT", "5432")
-        db = os.getenv("DB_NAME", "velo_dw")
+        db = os.getenv("DB_NAME", "velostar_db")
         
         self.engine = create_engine(f"postgresql://{user}:{pw}@{host}:{port}/{db}")
 
@@ -22,9 +22,9 @@ class VeloDashboard:
         query = """
             SELECT s.station_id, s.name, s.lat, s.lon, s.capacity,
                    f.num_bikes_available, f.num_docks_available, f.fill_rate
-            FROM dim_stations s
-            JOIN fact_station_status f ON s.station_id = f.station_id
-            WHERE f.collected_at = (SELECT MAX(collected_at) FROM fact_station_status)
+                 FROM stations_info s
+                 JOIN stations_status f ON s.station_id = f.station_id
+                 WHERE f.collected_at = (SELECT MAX(collected_at) FROM stations_status)
         """
         try:
             return pd.read_sql(query, self.engine)
