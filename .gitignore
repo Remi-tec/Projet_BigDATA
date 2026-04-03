@@ -1,12 +1,19 @@
 # .venv/
 .venv/
+.venv_airflow/
 # .env
 .env
+.env.airflow
 # Python
 __pycache__/
 *.py[cod]
 # Jupyter Notebook
 .ipynb_checkpoints/
+# Airflow
+airflow/
+logs/
+plugins/
+simple_auth_manager_passwords.json
 # VS Code
 .vscode/
 # OS
