@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, time, timedelta
 import pytz
+from shapely.geometry import Point, Polygon
 
 load_dotenv()
 
@@ -19,23 +20,44 @@ class VeloDashboard:
         
         self.engine = create_engine(f"postgresql://{user}:{pw}@{host}:{port}/{db}")
         
-        # Mapping station -> quartier
-        self.station_quartier_map = {
-            "République": "Centre-Ville",
-            "Parlement": "Centre-Ville",
-            "Palais du Parlement": "Centre-Ville",
-            "Gare SNCF": "Gare",
-            "Gare Centre": "Gare",
-            "Sainte-Anne": "Sainte-Thérèse",
-            "Sainte-Thérèse": "Sainte-Thérèse",
-            "Beaulieu Nord": "Beaulieu",
-            "Beaulieu Centre": "Beaulieu",
-            "Saint-Héller": "Saint-Héller",
-            "Saint-Héller Est": "Saint-Héller",
-            "Bourg l'Évêque": "Bourg l'Évêque",
-            "Jeanne d'Arc": "Jeanne d'Arc",
-            "Cleunay": "Cleunay",
-            "Arsenal": "Arsenal/Redon",
+        # Définition des périmètres des quartiers avec des polygones (coordonnées lat, lon)
+        self.quartier_polygons = {
+            "Centre-Ville": Polygon([
+                (48.1085, -1.6820), (48.1135, -1.6820), 
+                (48.1135, -1.6670), (48.1085, -1.6670)
+            ]),
+            "Gare": Polygon([
+                (48.0975, -1.6880), (48.1105, -1.6880), 
+                (48.1105, -1.6680), (48.0975, -1.6680)
+            ]),
+            "Sainte-Thérèse": Polygon([
+                (48.0920, -1.7050), (48.1090, -1.7050), 
+                (48.1090, -1.6750), (48.0920, -1.6750)
+            ]),
+            "Beaulieu": Polygon([
+                (48.0890, -1.6550), (48.1080, -1.6550), 
+                (48.1080, -1.6250), (48.0890, -1.6250)
+            ]),
+            "Saint-Héller": Polygon([
+                (48.1100, -1.7000), (48.1300, -1.7000), 
+                (48.1300, -1.6700), (48.1100, -1.6700)
+            ]),
+            "Bourg l'Évêque": Polygon([
+                (48.1050, -1.7200), (48.1250, -1.7200), 
+                (48.1250, -1.6850), (48.1050, -1.6850)
+            ]),
+            "Jeanne d'Arc": Polygon([
+                (48.0800, -1.7100), (48.0980, -1.7100), 
+                (48.0980, -1.6700), (48.0800, -1.6700)
+            ]),
+            "Cleunay": Polygon([
+                (48.1250, -1.7350), (48.1500, -1.7350), 
+                (48.1500, -1.6850), (48.1250, -1.6850)
+            ]),
+            "Arsenal/Redon": Polygon([
+                (48.1000, -1.6400), (48.1250, -1.6400), 
+                (48.1250, -1.6000), (48.1000, -1.6000)
+            ]),
         }
 
     def fix_timezone(self, df):
@@ -49,6 +71,21 @@ class VeloDashboard:
             df['collected_at'] = df['collected_at'].dt.tz_convert('Europe/Paris').dt.tz_localize(None)
         return df
 
+    def get_all_stations(self):
+        """Récupère tous les noms de stations de la BD"""
+        query = "SELECT DISTINCT name FROM stations_info ORDER BY name"
+        df = pd.read_sql(query, self.engine)
+        return df['name'].tolist() if not df.empty else []
+
+    def get_quartier_from_coordinates(self, lat, lon):
+        """Détermine le quartier basé sur les coordonnées (lat, lon) de la station
+        en utilisant des polygones pour délimiter les périmètres"""
+        point = Point(lat, lon)
+        for quartier, polygon in self.quartier_polygons.items():
+            if polygon.contains(point):
+                return quartier
+        return "Inconnu"  # Si la station est en dehors de tous les quartiers définis
+
     def load_latest_data(self):
         """Données pour la carte (Dernier état connu)"""
         query = """
@@ -60,8 +97,10 @@ class VeloDashboard:
         """
         df = pd.read_sql(query, self.engine)
         df = self.fix_timezone(df)
-        # Ajouter la colonne quartier
-        df['quartier'] = df['name'].map(self.station_quartier_map)
+        
+        # Ajouter la colonne quartier basée sur les coordonnées de la station
+        df['quartier'] = df.apply(lambda row: self.get_quartier_from_coordinates(row['lat'], row['lon']), axis=1)
+        
         return df
 
     def load_weekly_data(self, station_name, target_date):
@@ -70,18 +109,23 @@ class VeloDashboard:
         end_of_week = start_of_week + timedelta(days=6)
         
         query = f"""
-            SELECT f.num_bikes_available, f.fill_rate, f.collected_at
+            SELECT f.num_bikes_available, f.fill_rate, f.collected_at, s.lat, s.lon
             FROM stations_status f
             JOIN stations_info s ON s.station_id = f.station_id
             WHERE s.name = '{station_name}'
-              AND DATE(f.collected_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris') >= '{start_of_week}'
-              AND DATE(f.collected_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris') <= '{end_of_week}'
+              AND DATE(f.collected_at) >= '{start_of_week}'
+              AND DATE(f.collected_at) <= '{end_of_week}'
             ORDER BY f.collected_at ASC
         """
         df = pd.read_sql(query, self.engine)
         df = self.fix_timezone(df)
-        # Ajouter la colonne quartier
-        df['quartier'] = self.station_quartier_map.get(station_name, "Inconnu")
+        
+        # Ajouter la colonne quartier basée sur les coordonnées
+        if not df.empty:
+            lat, lon = df['lat'].iloc[0], df['lon'].iloc[0]
+            df['quartier'] = self.get_quartier_from_coordinates(lat, lon)
+            df = df.drop(['lat', 'lon'], axis=1)
+        
         return df
 
     def load_quartier_data(self, quartier, target_date):
@@ -89,28 +133,34 @@ class VeloDashboard:
         start_of_week = target_date - timedelta(days=target_date.weekday())
         end_of_week = start_of_week + timedelta(days=6)
         
-        # Trouver toutes les stations du quartier
-        stations_in_quartier = [name for name, q in self.station_quartier_map.items() if q == quartier]
-        
-        if not stations_in_quartier:
+        # Récupérer le polygone du quartier
+        polygon = self.quartier_polygons.get(quartier)
+        if not polygon:
             return pd.DataFrame()
         
-        # Créer une clause IN avec les noms des stations
-        station_list = "', '".join(stations_in_quartier)
+        # Récupérer les limites du polygone (bounds)
+        minx, miny, maxx, maxy = polygon.bounds
         
+        # Trouver toutes les stations dans cette zone de quartier
         query = f"""
-            SELECT f.num_bikes_available, f.fill_rate, f.collected_at
+            SELECT f.num_bikes_available, f.fill_rate, f.collected_at, s.lat, s.lon
             FROM stations_status f
             JOIN stations_info s ON s.station_id = f.station_id
-            WHERE s.name IN ('{station_list}')
-              AND DATE(f.collected_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris') >= '{start_of_week}'
-              AND DATE(f.collected_at AT TIME ZONE 'UTC' AT TIME ZONE 'Europe/Paris') <= '{end_of_week}'
+            WHERE s.lat >= {miny} AND s.lat <= {maxx}
+              AND s.lon >= {minx} AND s.lon <= {maxy}
+              AND DATE(f.collected_at) >= '{start_of_week}'
+              AND DATE(f.collected_at) <= '{end_of_week}'
             ORDER BY f.collected_at ASC
         """
         df = pd.read_sql(query, self.engine)
         df = self.fix_timezone(df)
-        # Ajouter la colonne quartier
-        df['quartier'] = quartier
+        
+        # Filtrer les stations qui sont vraiment dans le polygone
+        if not df.empty:
+            df = df[df.apply(lambda row: self.quartier_polygons[quartier].contains(Point(row['lat'], row['lon'])), axis=1)]
+            df['quartier'] = quartier
+            df = df.drop(['lat', 'lon'], axis=1)
+        
         return df
 
     def run(self):
@@ -207,7 +257,7 @@ class VeloDashboard:
                     st.markdown("Statistiques suplementaires ")
                     
                     k1, k2, k3 = st.columns(3)
-                    k4, k5, k6 = st.columns(3)
+                    k4, k5 = st.columns(3)
                     
                     with k1:
                         st.markdown(" Min / Max** *(24h vs 7j)")
@@ -230,14 +280,8 @@ class VeloDashboard:
                         st.metric("Disponibilité > 1", f"{fiabilite:.1f}%")
                         st.caption("Probabilité de trouver un vélo")
 
-                    with k5:
-                        volatilité = df_day_filtered['num_bikes_available'].std()
-                        st.markdown("**⚡ Activité (Tension)**")
-                        status = "Élevée" if volatilité > 5 else "Calme"
-                        st.metric("Flux de vélos", status)
-                        st.caption(f"Écart-type : {volatilité:.1f}")
 
-                    with k6:
+                    with k5:
                         if not df_week_filtered.empty:
                             idx_max = df_week_filtered['num_bikes_available'].idxmax()
                             heure_pic = df_week_filtered.loc[idx_max, 'collected_at'].strftime("%H:%M")
