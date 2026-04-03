@@ -26,6 +26,7 @@ from io import BytesIO
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
@@ -263,7 +264,7 @@ class GBFSIngester:
         return {
             "_metadata": {
                 "source":       source,
-                "collected_at": datetime.now().isoformat(),
+                "collected_at": datetime.now(ZoneInfo("Europe/Paris")).isoformat(),
                 "dataset":      "vls-gbfs-tr",
             },
             "data": data,

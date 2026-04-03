@@ -81,9 +81,17 @@ class VeloDashboard:
         """Détermine le quartier basé sur les coordonnées (lat, lon) de la station
         en utilisant des polygones pour délimiter les périmètres"""
         point = Point(lat, lon)
+        closest_quartier = None
+        closest_distance = None
         for quartier, polygon in self.quartier_polygons.items():
-            if polygon.contains(point):
+            if polygon.covers(point):
                 return quartier
+            distance = polygon.distance(point)
+            if closest_distance is None or distance < closest_distance:
+                closest_distance = distance
+                closest_quartier = quartier
+        if closest_distance is not None and closest_distance <= 0.03:
+            return closest_quartier
         return "Inconnu"  # Si la station est en dehors de tous les quartiers définis
 
     def load_latest_data(self):
@@ -146,8 +154,8 @@ class VeloDashboard:
             SELECT f.num_bikes_available, f.fill_rate, f.collected_at, s.lat, s.lon
             FROM stations_status f
             JOIN stations_info s ON s.station_id = f.station_id
-            WHERE s.lat >= {miny} AND s.lat <= {maxx}
-              AND s.lon >= {minx} AND s.lon <= {maxy}
+                        WHERE s.lat >= {minx} AND s.lat <= {maxx}
+                            AND s.lon >= {miny} AND s.lon <= {maxy}
               AND DATE(f.collected_at) >= '{start_of_week}'
               AND DATE(f.collected_at) <= '{end_of_week}'
             ORDER BY f.collected_at ASC
@@ -217,16 +225,11 @@ class VeloDashboard:
         if st.session_state.selected_station:
             st.divider()
             
-            head1, head2 = st.columns([5, 1])
-            
             # Récupérer le quartier de la station
             station_info = df_latest[df_latest['name'] == st.session_state.selected_station].iloc[0]
             quartier_station = station_info['quartier']
-            
-            head1.subheader(f" Analyse Station : {st.session_state.selected_station} ({quartier_station})")
-            if head2.button(" Fermer"):
-                st.session_state.selected_station = None
-                st.rerun()
+
+            st.subheader(f" Analyse Station : {st.session_state.selected_station} ({quartier_station})")
 
             # FILTRES
             f1, f2 = st.columns(2)
@@ -257,7 +260,7 @@ class VeloDashboard:
                     st.markdown("Statistiques suplementaires ")
                     
                     k1, k2, k3 = st.columns(3)
-                    k4, k5 = st.columns(3)
+                    k4, k5 = st.columns(2)
                     
                     with k1:
                         st.markdown(" Min / Max** *(24h vs 7j)")
@@ -296,10 +299,45 @@ class VeloDashboard:
         elif selected_quartier != "Tous":
             st.divider()
             
-            head1, head2 = st.columns([5, 1])
-            head1.subheader(f" Analyse Quartier : {selected_quartier}")
-            if head2.button(" Fermer le quartier"):
-                st.rerun()
+            st.subheader(f" Analyse Quartier : {selected_quartier}")
+
+            # Indicateurs de contexte pour le quartier selectionne (etat courant)
+            quartier_now = df_latest[df_latest['quartier'] == selected_quartier]
+            if quartier_now.empty:
+                st.warning("Aucune station n'est associee a ce quartier.")
+                return
+
+            stations_count = len(quartier_now)
+            capacity_total = int(quartier_now['capacity'].sum())
+            bikes_total = int(quartier_now['num_bikes_available'].sum())
+            docks_total = int(quartier_now['num_docks_available'].sum())
+            fill_rate_avg = float(quartier_now['fill_rate'].mean())
+            occupancy_rate = (bikes_total / capacity_total * 100) if capacity_total > 0 else 0.0
+
+            kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+            kpi1.metric("Stations", f"{stations_count}")
+            kpi2.metric("Capacite totale", f"{capacity_total}")
+            kpi3.metric("Velos dispo", f"{bikes_total}")
+            kpi4.metric("Places libres", f"{docks_total}")
+            kpi5.metric("Remplissage moyen", f"{fill_rate_avg:.1f}%")
+            kpi6.metric("Occupation", f"{occupancy_rate:.1f}%")
+
+            top5 = quartier_now.sort_values("num_bikes_available", ascending=False).head(5)
+            low5 = quartier_now.sort_values("num_bikes_available", ascending=True).head(5)
+
+            st.markdown("Stations les plus fournies (etat courant)")
+            st.dataframe(
+                top5[["name", "num_bikes_available", "num_docks_available", "fill_rate"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("Stations les plus vides (etat courant)")
+            st.dataframe(
+                low5[["name", "num_bikes_available", "num_docks_available", "fill_rate"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
             # FILTRES
             f1, f2 = st.columns(2)
@@ -312,6 +350,58 @@ class VeloDashboard:
             df_week = self.load_quartier_data(selected_quartier, chosen_date)
 
             if not df_week.empty:
+                # KPIs region (quartier) bases sur l'historique de la semaine
+                region_bikes_mean = float(df_week['num_bikes_available'].mean())
+                region_bikes_min = int(df_week['num_bikes_available'].min())
+                region_bikes_max = int(df_week['num_bikes_available'].max())
+                region_fill_mean = float(df_week['fill_rate'].mean())
+                region_volatility = float(df_week['num_bikes_available'].std())
+                region_low_supply_rate = float((df_week['num_bikes_available'] <= 5).mean() * 100)
+
+                r1, r2, r3, r4, r5, r6 = st.columns(6)
+                r1.metric("Moyenne velos (7j)", f"{region_bikes_mean:.1f}")
+                r2.metric("Min velos (7j)", f"{region_bikes_min}")
+                r3.metric("Max velos (7j)", f"{region_bikes_max}")
+                r4.metric("Remplissage moyen (7j)", f"{region_fill_mean:.1f}%")
+                r5.metric("Volatilite (7j)", f"{region_volatility:.1f}")
+                r6.metric("Sous-seuil <= 5", f"{region_low_supply_rate:.1f}%")
+
+                # Visualisation des KPIs region
+                kpi_chart_col1, kpi_chart_col2 = st.columns(2)
+
+                with kpi_chart_col1:
+                    kpi_df = pd.DataFrame({
+                        "KPI": ["Min", "Moyenne", "Max"],
+                        "Velos": [region_bikes_min, region_bikes_mean, region_bikes_max],
+                    })
+                    fig_kpi_bar = px.bar(
+                        kpi_df,
+                        x="KPI",
+                        y="Velos",
+                        title="Vélos disponibles (7j)",
+                        text="Velos",
+                    )
+                    fig_kpi_bar.update_traces(textposition="outside")
+                    fig_kpi_bar.update_layout(margin={"r": 0, "t": 40, "l": 0, "b": 0})
+                    st.plotly_chart(fig_kpi_bar, use_container_width=True)
+
+                with kpi_chart_col2:
+                    occ_free = max(0.0, 100.0 - occupancy_rate)
+                    pie_df = pd.DataFrame({
+                        "Etat": ["Occupation", "Libre"],
+                        "Pourcentage": [occupancy_rate, occ_free],
+                    })
+                    fig_kpi_pie = px.pie(
+                        pie_df,
+                        names="Etat",
+                        values="Pourcentage",
+                        title="Occupation (etat courant)",
+                        hole=0.55,
+                    )
+                    fig_kpi_pie.update_traces(textinfo="percent+label")
+                    fig_kpi_pie.update_layout(margin={"r": 0, "t": 40, "l": 0, "b": 0})
+                    st.plotly_chart(fig_kpi_pie, use_container_width=True)
+
                 start_t, end_t = time_range
                 df_day = df_week[df_week['collected_at'].dt.date == chosen_date]
                 df_day_filtered = df_day[(df_day['collected_at'].dt.time >= start_t) & (df_day['collected_at'].dt.time <= end_t)]
@@ -319,6 +409,28 @@ class VeloDashboard:
                 df_week_filtered = df_week[(df_week['collected_at'].dt.time >= start_t) & (df_week['collected_at'].dt.time <= end_t)]
 
                 if not df_day_filtered.empty:
+                    # KPIs comparatifs jour vs semaine (delta)
+                    day_bikes_mean = float(df_day_filtered['num_bikes_available'].mean())
+                    day_fill_mean = float(df_day_filtered['fill_rate'].mean())
+                    day_low_supply_rate = float((df_day_filtered['num_bikes_available'] <= 5).mean() * 100)
+
+                    delta_col1, delta_col2, delta_col3 = st.columns(3)
+                    delta_col1.metric(
+                        "Velos moyens (jour)",
+                        f"{day_bikes_mean:.1f}",
+                        f"{day_bikes_mean - region_bikes_mean:+.1f}",
+                    )
+                    delta_col2.metric(
+                        "Remplissage (jour)",
+                        f"{day_fill_mean:.1f}%",
+                        f"{day_fill_mean - region_fill_mean:+.1f}%",
+                    )
+                    delta_col3.metric(
+                        "Sous-seuil <= 5 (jour)",
+                        f"{day_low_supply_rate:.1f}%",
+                        f"{day_low_supply_rate - region_low_supply_rate:+.1f}%",
+                    )
+
                     # Agréger les données du quartier
                     df_day_agg = df_day_filtered.groupby('collected_at').agg({
                         'num_bikes_available': 'sum',
