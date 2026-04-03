@@ -141,7 +141,11 @@ FAKE_WRAPPER_STATUS = {
 class TestGBFSIngester:
 
     def setup_method(self):
+        os.environ["GBFS_INDEX_URL"] = "https://fake.url/index.json"
         self.ingester = GBFSIngester(data_lake_dir="raw/test", storage=DummyStorage())
+
+    def teardown_method(self):
+        os.environ.pop("GBFS_INDEX_URL", None)
 
     @patch("pipeline_velostar.requests.get")
     def test_fetch_index_returns_dict(self, mock_get):

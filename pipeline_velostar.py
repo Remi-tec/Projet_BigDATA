@@ -188,10 +188,7 @@ class GBFSIngester:
     Étape 3 : sauvegarde les données brutes dans le Data Lake MinIO.
     """
 
-    INDEX_URL = (
-        "https://data.rennesmetropole.fr/api/explore/v2.1"
-        "/catalog/datasets/vls-gbfs-tr/records?limit=20"
-    )
+    INDEX_URL_ENV = "GBFS_INDEX_URL"
 
     TARGET_FEEDS = {
         "station_information.json": "station_information",
@@ -202,10 +199,16 @@ class GBFSIngester:
         self,
         data_lake_dir: str = os.path.join("raw", "velostar"),
         storage: StorageBackend | None = None,
+        index_url: str | None = None,
     ):
         self.data_lake_dir = data_lake_dir
         self.storage = storage or create_storage_from_env()
         self.output_folder: str | None = None
+        self.index_url = index_url or os.getenv(self.INDEX_URL_ENV)
+        if not self.index_url:
+            raise RuntimeError(
+                f"{self.INDEX_URL_ENV} n'est pas defini."
+            )
 
     # ── Méthodes publiques ──────────────────────
 
@@ -216,7 +219,7 @@ class GBFSIngester:
 
         feed_index = self._fetch_index()
         self._save(
-            self._add_metadata({"feeds": feed_index}, self.INDEX_URL),
+            self._add_metadata({"feeds": feed_index}, self.index_url),
             "gbfs_index",
         )
 
@@ -243,7 +246,7 @@ class GBFSIngester:
 
     def _fetch_index(self) -> dict:
         logger.info("Récupération de l'index GBFS...")
-        response = requests.get(self.INDEX_URL, timeout=15)
+        response = requests.get(self.index_url, timeout=15)
         response.raise_for_status()
         records = response.json().get("results", [])
         index   = {r["idfilegbfs"]: r["filegbfsurl"] for r in records if "filegbfsurl" in r}

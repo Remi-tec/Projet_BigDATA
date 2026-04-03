@@ -128,7 +128,8 @@ class VeloDashboard:
             return
 
         # Récupérer la liste des quartiers
-        quartiers = sorted(df_latest['quartier'].unique())
+        # S'assurer que seuls les quartiers valides (str) sont pris en compte
+        quartiers = sorted([q for q in df_latest['quartier'].unique() if isinstance(q, str)])
         selected_quartier = st.selectbox("Sélectionner un quartier :", ["Tous"] + list(quartiers))
 
         # Filtrer les données par quartier
